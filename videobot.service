@@ -1,0 +1,14 @@
+[Unit]
+Description=AI Video Telegram Bot
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+WorkingDirectory=/root/videobot
+ExecStart=/usr/bin/python3 /root/videobot/bot.py
+Restart=always
+RestartSec=10
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target

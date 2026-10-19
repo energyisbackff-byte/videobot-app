@@ -1,0 +1,7 @@
+.env
+subs.json
+bot.log
+__pycache__/
+*.mp4
+*.jpg
+*.tmp
