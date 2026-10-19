@@ -1,9 +1,10 @@
-"""Subscription storage + USDT (TRC20) on-chain payment watcher.
+"""Subscription storage + Bitcoin on-chain payment watcher.
 
 Anti-fraud model: every user who starts a subscription gets a UNIQUE amount
-(price + unique cents, e.g. 20.37). The watcher matches the exact incoming
-amount to the pending user. No TXIDs, no screenshots, nothing to fake.
-Used transaction ids are recorded so a payment can never be claimed twice.
+in satoshis (price converted at the current BTC rate + a unique sat offset).
+The watcher matches the exact incoming sat amount on-chain after the required
+confirmations. No TXIDs, no screenshots, nothing to fake. Used txids are
+recorded so a payment can never be claimed twice.
 """
 import json
 import os
@@ -13,9 +14,10 @@ import time
 
 import requests
 
-USDT_CONTRACT = "TR7NHqjeFYxGTCi8q8Zy4KoLJH7fJDwWahN"  # official USDT on TRON
 DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "subs.json")
-PENDING_TTL = 24 * 3600          # a reserved amount stays valid 24 h
+PENDING_TTL = 2 * 3600           # a rate-locked quote stays valid 2 h
+BLOCKSTREAM_API = "https://blockstream.info/api"
+MEMPOOL_API = "https://mempool.space/api"
 
 _lock = threading.Lock()
 _state = {"subs": {}, "pending": {}, "used_txids": [], "usage": {}}
@@ -81,21 +83,46 @@ def list_subs() -> dict:
 
 # --------------------------- pending payments -------------------------------
 
-def get_or_create_pending(user_id: int, price: float) -> float:
-    """Unique payable amount for this user, valid for PENDING_TTL."""
+def _btc_usd_rate() -> float | None:
+    """Current BTC/USD rate from two independent public APIs."""
+    try:
+        r = requests.get(f"{MEMPOOL_API}/v1/prices", timeout=15)
+        if r.status_code == 200:
+            return float(r.json()["USD"])
+    except Exception:
+        pass
+    try:
+        r = requests.get(
+            "https://api.coingecko.com/api/v3/simple/price",
+            params={"ids": "bitcoin", "vs_currencies": "usd"}, timeout=15)
+        if r.status_code == 200:
+            return float(r.json()["bitcoin"]["usd"])
+    except Exception:
+        pass
+    return None
+
+
+def get_or_create_pending(user_id: int, price_usd: float) -> dict | None:
+    """Unique satoshi amount for this user, rate-locked for PENDING_TTL."""
     with _lock:
         key = str(user_id)
         p = _state["pending"].get(key)
         if p and time.time() - p["created"] < PENDING_TTL:
-            return p["amount"]
-        taken = {x["amount"] for x in _state["pending"].values()}
+            return dict(p)
+    rate = _btc_usd_rate()
+    if not rate:
+        return None
+    with _lock:
+        taken = {x["sats"] for x in _state["pending"].values()}
         while True:
-            amount = round(price + random.randint(11, 89) / 100, 2)
-            if amount not in taken:
+            sats = int(price_usd / rate * 100_000_000) + random.randint(120, 980)
+            if sats not in taken:
                 break
-        _state["pending"][key] = {"amount": amount, "created": time.time()}
+        p = {"sats": sats, "btc": f"{sats / 100_000_000:.8f}",
+             "rate": rate, "created": time.time()}
+        _state["pending"][key] = p
         _save()
-        return amount
+        return dict(p)
 
 
 # --------------------------- monthly usage ----------------------------------
@@ -119,41 +146,51 @@ def increment_usage(user_id: int):
 
 # --------------------------- on-chain watcher -------------------------------
 
-def check_tron_payments(wallet: str) -> list[dict]:
-    """Scan incoming USDT-TRC20 transfers; return newly matched payments."""
-    if not wallet or wallet.startswith("PUT_"):
+def check_btc_payments(address: str, confirmations: int = 1) -> list[dict]:
+    """Scan incoming BTC transfers; return newly matched, confirmed payments."""
+    if not address or address.startswith("PUT_"):
         return []
     try:
-        r = requests.get(
-            f"https://api.trongrid.io/v1/accounts/{wallet}/transactions/trc20",
-            params={"only_to": "true", "limit": 50}, timeout=30)
+        r = requests.get(f"{BLOCKSTREAM_API}/address/{address}/txs", timeout=30)
         if r.status_code != 200:
             return []
-        txs = r.json().get("data", [])
+        txs = r.json()
     except Exception:
         return []
+    tip = None
+    try:
+        tip = int(requests.get(f"{BLOCKSTREAM_API}/blocks/tip/height",
+                               timeout=15).text)
+    except Exception:
+        pass
 
     found = []
     with _lock:
         used = set(_state["used_txids"])
         pendings = dict(_state["pending"])
 
-    for tx in txs:
-        txid = tx.get("transaction_id")
+    for tx in txs[:50]:
+        txid = tx.get("txid")
         if not txid or txid in used:
             continue
-        if (tx.get("token_info") or {}).get("address") != USDT_CONTRACT:
+        st = tx.get("status") or {}
+        if not st.get("confirmed"):
             continue
-        if tx.get("to") != wallet:
-            continue
-        try:
-            amount = round(int(tx["value"]) / 1_000_000, 2)  # USDT = 6 decimals
-        except Exception:
+        if tip and confirmations > 1:
+            confs = tip - int(st.get("block_height", 0)) + 1
+            if confs < confirmations:
+                continue
+
+        amount = 0
+        for out in tx.get("vout", []):
+            if out.get("scriptpubkey_address") == address:
+                amount += int(out.get("value", 0))
+        if amount <= 0:
             continue
 
         match = None
         for uid, p in pendings.items():
-            if p["amount"] == amount and time.time() - p["created"] < PENDING_TTL:
+            if p["sats"] == amount and time.time() - p["created"] < PENDING_TTL:
                 match = uid
                 break
 
@@ -163,5 +200,6 @@ def check_tron_payments(wallet: str) -> list[dict]:
             _save()
 
         if match:
-            found.append({"user_id": int(match), "txid": txid, "amount": amount})
+            found.append({"user_id": int(match), "txid": txid, "sats": amount,
+                          "btc": f"{amount / 100_000_000:.8f}"})
     return found
