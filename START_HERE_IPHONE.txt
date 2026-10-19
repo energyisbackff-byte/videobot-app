@@ -1,0 +1,31 @@
+START HERE — iPhone (a-Shell) setup, ~10 minutes
+================================================
+
+STEP 1 — Get your bot token (in Telegram)
+  1. Open Telegram, search @BotFather
+  2. Send: /newbot
+  3. Send a name, e.g.: AI Video Studio
+  4. Send a username ending in "bot"
+  5. BotFather replies with your TOKEN — copy it
+
+STEP 2 — Get your fal.ai key (in Safari)
+  1. Go to https://fal.ai and sign up
+  2. Dashboard -> Keys -> Create new key -> copy it
+  3. Dashboard -> Billing -> add ~$10 balance
+
+STEP 3 — Get your Telegram ID (in Telegram)
+  - Search @userinfobot, press Start, copy your numeric ID
+
+STEP 4 — Put files on the phone
+  - Download telegram_video_bot.zip from this chat
+  - In the Files app, unzip it and move the files into:
+    On My iPhone -> a-Shell -> Documents -> videobot
+
+STEP 5 — In a-Shell, run (paste your own 3 values on line 3):
+  cd ~/Documents/videobot
+  printf 'BOT_TOKEN=PASTE_TOKEN\nFAL_KEY=PASTE_FAL_KEY\nADMIN_ID=PASTE_ID\n' > .env
+  pip install --user python-telegram-bot requests
+  python3 bot.py
+
+IF ANYTHING ERRORS: copy the exact error text and paste it back
+for a fixed file.
