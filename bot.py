@@ -14,6 +14,10 @@ import subprocess
 import time
 from collections import defaultdict
 from html import escape
+import re
+
+VALID_BTC = re.compile(r"^(bc1[a-z0-9]{25,59}|[13][a-km-zA-HJ-NP-Z1-9]{25,34})$",
+                       re.IGNORECASE)
 
 from telegram import (InlineKeyboardButton, InlineKeyboardMarkup, Update)
 from telegram.ext import (Application, CallbackQueryHandler, CommandHandler,
@@ -32,6 +36,7 @@ logging.basicConfig(
 log = logging.getLogger("videobot")
 
 AWAITING_INPUT, AWAITING_PROMPT, AWAITING_TIER = range(3)
+WALLET_WAIT, PRICE_WAIT = 3, 4
 
 job_queue: asyncio.Queue = asyncio.Queue()
 daily_usage: dict[int, list[float]] = defaultdict(list)
@@ -49,7 +54,9 @@ ADMIN_MENU = (
     "/approve &lt;id&gt; [days] — grant a subscription manually\n"
     "/revoke &lt;id&gt; — remove a subscription\n"
     "/subs — list active subscribers\n\n"
-    "Wallet: /set WALLET_ADDRESS=bc1… · Price: /set MONTHLY_PRICE_USD=25"
+    "/wallet — set the receiving Bitcoin address\n"
+    "/price — set the monthly price (USD)\n"
+    "/set KEY=VALUE — advanced: edit any configuration value"
 )
 
 HELP_MENU = (
@@ -251,7 +258,9 @@ async def cmd_set(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if not _is_admin(update):
         return
     if not ctx.args or "=" not in ctx.args[0]:
-        await update.message.reply_text("Usage: /set KEY=VALUE")
+        await update.message.reply_text(
+            "Usage: /set KEY=VALUE\n"
+            "Common settings have their own commands: /wallet and /price.")
         return
     kv = ctx.args[0]
     key = kv.split("=", 1)[0].strip()
@@ -350,6 +359,71 @@ async def cmd_subs(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         lines.append(
             f"● <code>{uid}</code> — until {_fmt_date(s['until'])} ({escape(s.get('granted_by',''))})")
     await update.message.reply_text(_clip("\n".join(lines)), parse_mode="HTML")
+
+
+# --------------------- admin: wallet & price (conversational) ---------------
+
+async def wallet_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return ConversationHandler.END
+    await update.message.reply_text(
+        "Send the <b>Bitcoin address</b> that payments should go to.\n"
+        "Formats: bc1q…, bc1p…, 1…, or 3…\n"
+        "Send /cancel to abort.",
+        parse_mode="HTML")
+    return WALLET_WAIT
+
+
+async def wallet_got(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    addr = (update.message.text or "").strip()
+    if not VALID_BTC.match(addr):
+        await update.message.reply_text(
+            "That doesn't look like a valid Bitcoin address. "
+            "Check it and send again, or /cancel.")
+        return WALLET_WAIT
+    await _run_shell(
+        f"cd /root/videobot && (grep -q '^WALLET_ADDRESS=' .env && "
+        f"sed -i 's|^WALLET_ADDRESS=.*|WALLET_ADDRESS={addr}|' .env "
+        f"|| echo 'WALLET_ADDRESS={addr}' >> .env)")
+    await update.message.reply_text(
+        f"Done. Payments will now go to:\n<code>{escape(addr)}</code>\n\n"
+        "Restarting the watcher on this address…",
+        parse_mode="HTML")
+    await _run_shell(
+        "nohup bash -c 'sleep 2; systemctl restart videobot' >/dev/null 2>&1 &")
+    return ConversationHandler.END
+
+
+async def price_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    if not _is_admin(update):
+        return ConversationHandler.END
+    await update.message.reply_text(
+        f"Current monthly price: {config.MONTHLY_PRICE_USD:.0f} USD.\n"
+        "Send the new price in USD (numbers only), or /cancel to abort.")
+    return PRICE_WAIT
+
+
+async def price_got(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
+    raw = (update.message.text or "").strip().lstrip("$").replace(",", ".")
+    try:
+        price = float(raw)
+        if not (1 <= price <= 10000):
+            raise ValueError
+    except ValueError:
+        await update.message.reply_text(
+            "Send a plain number between 1 and 10000 — e.g. 25. Or /cancel.")
+        return PRICE_WAIT
+    kv = f"MONTHLY_PRICE_USD={price:g}"
+    await _run_shell(
+        f"cd /root/videobot && (grep -q '^MONTHLY_PRICE_USD=' .env && "
+        f"sed -i 's|^MONTHLY_PRICE_USD=.*|{kv}|' .env "
+        f"|| echo '{kv}' >> .env)")
+    await update.message.reply_text(
+        f"Done. Monthly price set to <b>{price:g} USD</b>. Restarting…",
+        parse_mode="HTML")
+    await _run_shell(
+        "nohup bash -c 'sleep 2; systemctl restart videobot' >/dev/null 2>&1 &")
+    return ConversationHandler.END
 
 
 # ------------------------- generate conversation ----------------------------
@@ -562,6 +636,17 @@ def main():
     app.add_handler(CommandHandler("approve", cmd_approve))
     app.add_handler(CommandHandler("revoke", cmd_revoke))
     app.add_handler(CommandHandler("subs", cmd_subs))
+
+    admin_settings_conv = ConversationHandler(
+        entry_points=[CommandHandler("wallet", wallet_start),
+                      CommandHandler("price", price_start)],
+        states={
+            WALLET_WAIT: [MessageHandler(filters.TEXT & ~filters.COMMAND, wallet_got)],
+            PRICE_WAIT:  [MessageHandler(filters.TEXT & ~filters.COMMAND, price_got)],
+        },
+        fallbacks=[CommandHandler("cancel", cmd_cancel)],
+    )
+    app.add_handler(admin_settings_conv)
     app.add_handler(conv)
 
     log.info("Bot starting (polling)…")
